@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 import torch
 from torch.distributions.categorical import Categorical
@@ -985,3 +986,221 @@ class PPOTrainer(BaseTrainer):
                 on_episode_end(episode, score, scores)
 
         return scores
+
+
+class GRPOTrainer(BaseTrainer):
+    def __init__(self, env: BaseEnvironment, device=None) -> None:
+        super().__init__(env)
+        self.device = device
+
+    def policy(self, actor, reference_actor, state):
+        state = torch.tensor(state, dtype=torch.float).to(self.device)
+
+        logits = actor(state)
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+
+        reference_logits = reference_actor(state)
+        reference_dist = Categorical(logits=reference_logits)
+        reference_log_prob = reference_dist.log_prob(action)
+
+        return (
+            action.cpu().detach().numpy(),
+            log_prob.cpu().detach().numpy(),
+            reference_log_prob.cpu().detach().numpy(),
+        )
+
+    def group_relative_advantages(self, rewards, eps=1e-9):
+        rewards = np.array(rewards, dtype=np.float32)
+        return (rewards - rewards.mean()) / (rewards.std() + eps)
+
+    def train(
+        self,
+        actor: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        n_episodes: int,
+        group_size: int,
+        batch_size: int,
+        grpo_epochs: int = 4,
+        clip_param: float = 0.2,
+        beta: float = 0.01,
+        entropy_coeff: float = 0.0,
+        mini_batch_size: int = None,
+        max_steps: int = None,
+        reference_actor: torch.nn.Module = None,
+        reference_update_interval: int = None,
+        on_episode_end = None,
+    ):
+        assert group_size >= 2, "group_size must be at least 2 for group-relative advantages"
+
+        if reference_actor is None:
+            reference_actor = copy.deepcopy(actor)
+        if self.device is not None:
+            reference_actor.to(self.device)
+        reference_actor.eval()
+        for parameter in reference_actor.parameters():
+            parameter.requires_grad = False
+
+        scores = []
+        scores_window = deque(maxlen=100)
+        update_count = 0
+        batch_states = []
+        batch_actions = []
+        batch_old_log_probs = []
+        batch_reference_log_probs = []
+        batch_advantages = []
+
+        tqdm_range = tqdm(total=n_episodes)
+        episode = 0
+        while episode < n_episodes:
+            group_trajectories = []
+            group_scores = []
+            current_group_size = min(group_size, n_episodes - episode)
+
+            for _ in range(current_group_size):
+                state, _ = self.env.reset()
+                trajectory = {
+                    "states": [],
+                    "actions": [],
+                    "old_log_probs": [],
+                    "reference_log_probs": [],
+                }
+
+                score = 0
+                step = 0
+                while True:
+                    with torch.no_grad():
+                        action, log_prob, reference_log_prob = self.policy(actor, reference_actor, state)
+
+                    next_state, reward, terminated, truncated, _ = self.env.step(action.item())
+                    done = terminated or truncated
+
+                    trajectory["states"].append(state)
+                    trajectory["actions"].append(action)
+                    trajectory["old_log_probs"].append(log_prob)
+                    trajectory["reference_log_probs"].append(reference_log_prob)
+
+                    score += reward
+                    state = next_state
+                    step += 1
+
+                    max_steps_reached = max_steps is not None and step >= max_steps
+                    if done or max_steps_reached:
+                        break
+
+                group_trajectories.append(trajectory)
+                group_scores.append(score)
+                scores.append(score)
+                scores_window.append(score)
+                tqdm_range.update(1)
+                tqdm_range.set_description(f"Score: {np.mean(scores_window)}")
+                if on_episode_end is not None:
+                    on_episode_end(episode, score, scores)
+                episode += 1
+
+            group_advantages = self.group_relative_advantages(group_scores)
+            for trajectory, advantage in zip(group_trajectories, group_advantages):
+                batch_states.extend(trajectory["states"])
+                batch_actions.extend(trajectory["actions"])
+                batch_old_log_probs.extend(trajectory["old_log_probs"])
+                batch_reference_log_probs.extend(trajectory["reference_log_probs"])
+                batch_advantages.extend([advantage] * len(trajectory["states"]))
+
+            if len(batch_states) >= batch_size:
+                self._update_actor(
+                    actor=actor,
+                    optimizer=optimizer,
+                    states=batch_states,
+                    actions=batch_actions,
+                    old_log_probs=batch_old_log_probs,
+                    reference_log_probs=batch_reference_log_probs,
+                    advantages=batch_advantages,
+                    grpo_epochs=grpo_epochs,
+                    clip_param=clip_param,
+                    beta=beta,
+                    entropy_coeff=entropy_coeff,
+                    mini_batch_size=mini_batch_size,
+                )
+                update_count += 1
+                if reference_update_interval is not None and reference_update_interval > 0 and update_count % reference_update_interval == 0:
+                    reference_actor.load_state_dict(actor.state_dict())
+
+                batch_states = []
+                batch_actions = []
+                batch_old_log_probs = []
+                batch_reference_log_probs = []
+                batch_advantages = []
+
+        if len(batch_states) > 0:
+            self._update_actor(
+                actor=actor,
+                optimizer=optimizer,
+                states=batch_states,
+                actions=batch_actions,
+                old_log_probs=batch_old_log_probs,
+                reference_log_probs=batch_reference_log_probs,
+                advantages=batch_advantages,
+                grpo_epochs=grpo_epochs,
+                clip_param=clip_param,
+                beta=beta,
+                entropy_coeff=entropy_coeff,
+                mini_batch_size=mini_batch_size,
+            )
+
+        tqdm_range.close()
+        return scores
+
+    def _update_actor(
+        self,
+        actor,
+        optimizer,
+        states,
+        actions,
+        old_log_probs,
+        reference_log_probs,
+        advantages,
+        grpo_epochs,
+        clip_param,
+        beta,
+        entropy_coeff,
+        mini_batch_size,
+    ):
+        states = torch.tensor(np.array(states), dtype=torch.float).to(self.device)
+        actions = torch.tensor(np.array(actions), dtype=torch.int64).to(self.device)
+        old_log_probs = torch.tensor(np.array(old_log_probs), dtype=torch.float).to(self.device)
+        reference_log_probs = torch.tensor(np.array(reference_log_probs), dtype=torch.float).to(self.device)
+        advantages = torch.tensor(np.array(advantages), dtype=torch.float).to(self.device)
+
+        current_mini_batch_size = len(states) if mini_batch_size is None else mini_batch_size
+        current_mini_batch_size = max(1, min(current_mini_batch_size, len(states)))
+
+        for _ in range(grpo_epochs):
+            shuffled_indices = torch.randperm(len(states), device=states.device)
+
+            for start in range(0, len(states), current_mini_batch_size):
+                mini_batch_indices = shuffled_indices[start:start + current_mini_batch_size]
+                mini_batch_states = states[mini_batch_indices]
+                mini_batch_actions = actions[mini_batch_indices]
+                mini_batch_old_log_probs = old_log_probs[mini_batch_indices]
+                mini_batch_reference_log_probs = reference_log_probs[mini_batch_indices]
+                mini_batch_advantages = advantages[mini_batch_indices]
+
+                logits = actor(mini_batch_states)
+                dist = Categorical(logits=logits)
+                new_log_probs = dist.log_prob(mini_batch_actions)
+                entropy = dist.entropy().mean()
+
+                ratio = torch.exp(new_log_probs - mini_batch_old_log_probs)
+                surr1 = ratio * mini_batch_advantages
+                surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * mini_batch_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                sampled_kl = torch.exp(mini_batch_reference_log_probs - new_log_probs) - (
+                    mini_batch_reference_log_probs - new_log_probs
+                ) - 1.0
+                loss = policy_loss + beta * sampled_kl.mean() - entropy_coeff * entropy
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
