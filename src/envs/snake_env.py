@@ -9,19 +9,22 @@ from src.envs.base_env import BaseEnvironment
 
 class SnakeGameEnvironment(BaseEnvironment):
 
-    def __init__(self, width, height, block_size, speed):
+    def __init__(self, width, height, block_size, speed, render_enabled=True):
         pygame.init()
         self.width = width
         self.height = height
         self.block_size = block_size
         self.speed = speed
+        self.render_enabled = render_enabled
 
         self.head = (width // 2, height // 2)
         self.snake = [self.head]
 
-        self.screen = pygame.display.set_mode((width, height))
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont(None, 30)
+        self.screen = None
+        self.font = None
+        if self.render_enabled:
+            self._init_display()
         self.colors ={
             "black": (0, 0, 0),
             "white": (255, 255, 255),
@@ -48,6 +51,17 @@ class SnakeGameEnvironment(BaseEnvironment):
             "collision": -10,
             "food": 10
         }
+
+    def _init_display(self):
+        if self.screen is None:
+            self.screen = pygame.display.set_mode((self.width, self.height))
+        if self.font is None:
+            self.font = pygame.font.SysFont(None, 30)
+
+    def set_render_enabled(self, render_enabled: bool):
+        self.render_enabled = render_enabled
+        if self.render_enabled:
+            self._init_display()
 
     def check_collision(self, segment = None):
         if segment is None:
@@ -143,16 +157,18 @@ class SnakeGameEnvironment(BaseEnvironment):
         else:
             self.snake.pop(0)
 
-        self.render()
-        self.clock.tick(self.speed)
+        if self.render_enabled:
+            self.render()
+            self.clock.tick(self.speed)
 
         return (self.state, reward, terminated, truncated, info)
 
     def handle_input(self, action: int | str): # 0 = left, 1 = straight, 2 = right
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                quit()
+        if self.render_enabled:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    quit()
         
         action = action if isinstance(action, str) else self.actions[action]
         
@@ -192,6 +208,7 @@ class SnakeGameEnvironment(BaseEnvironment):
             self.head = (self.head[0], self.head[1] + self.block_size)
 
     def render(self, save_path = None):
+        self._init_display()
         self.screen.fill(self.colors["beige"])
         pygame.draw.rect(self.screen, self.colors["purple"], [self.food[0], self.food[1], self.block_size, self.block_size])
 

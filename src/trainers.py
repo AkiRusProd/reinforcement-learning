@@ -818,17 +818,17 @@ class PPOTrainer(BaseTrainer):
     def policy(self, actor, critic, state):
         state = torch.tensor(state, dtype=torch.float).to(self.device)
 
-        probs = actor(state)
-        dist = Categorical(probs)
+        logits = actor(state)
+        dist = Categorical(logits=logits)
         action = dist.sample()
 
         value = critic(state)
 
-        return action.cpu().detach().numpy(), value.cpu().detach().numpy(), dist.log_prob(action).cpu().detach().numpy() # The same as torch.log(probs)
+        return action.cpu().detach().numpy(), value.cpu().detach().numpy(), dist.log_prob(action).cpu().detach().numpy()
     
-    def reward_to_go(self, rewards, dones, gamma=1.0, normalize=False):
+    def reward_to_go(self, rewards, dones, gamma=1.0, normalize=False, last_value=0.0):
         rewards_to_go = []
-        cumulative_reward = 0
+        cumulative_reward = last_value
         for reward, done in zip(reversed(rewards), reversed(dones)):
             cumulative_reward = reward + gamma * (1 - done) * cumulative_reward
             rewards_to_go.insert(0, cumulative_reward)
@@ -837,6 +837,24 @@ class PPOTrainer(BaseTrainer):
             rewards_to_go = (rewards_to_go - np.mean(rewards_to_go)) / (np.std(rewards_to_go) + 1e-9)
 
         return rewards_to_go
+
+    def generalized_advantage_estimation(self, rewards, values, dones, last_value=0.0, gamma=0.99, gae_lambda=0.95):
+        rewards = np.array(rewards, dtype=np.float32)
+        values = np.array(values, dtype=np.float32).reshape(-1)
+        dones = np.array(dones, dtype=np.float32)
+
+        advantages = np.zeros_like(rewards, dtype=np.float32)
+        last_advantage = 0.0
+
+        for index in reversed(range(len(rewards))):
+            next_value = last_value if index == len(rewards) - 1 else values[index + 1]
+            next_not_done = 1.0 - dones[index]
+            delta = rewards[index] + gamma * next_value * next_not_done - values[index]
+            last_advantage = delta + gamma * gae_lambda * next_not_done * last_advantage
+            advantages[index] = last_advantage
+
+        returns = advantages + values
+        return advantages, returns
 
     def train(
         self,
@@ -853,6 +871,11 @@ class PPOTrainer(BaseTrainer):
         entropy_coeff: float = 0.01,
         clip_param: float = 0.2, 
         max_steps: int = None,
+        on_episode_end = None,
+        advantage: str = "monte carlo",
+        gae_lambda: float = 0.95,
+        normalize_advantages: bool = True,
+        mini_batch_size: int = None,
     ):
         tqdm_range = tqdm(range(n_episodes), total=n_episodes)
 
@@ -871,62 +894,94 @@ class PPOTrainer(BaseTrainer):
 
                 done = terminated or truncated
 
-                self.buffer.add(state, action, value, reward, done, log_prob)
+                self.buffer.add(state, action, value, reward, terminated, log_prob)
 
                 score += reward
 
                 state = next_state
+                step += 1
 
-                if done or step == max_steps:
+                max_steps_reached = max_steps is not None and step >= max_steps
+
+                if done or max_steps_reached:
                     cache = self.buffer.take()
                     states, actions, values, rewards, dones, log_probs = map(np.array, zip(*cache))
 
-                    rewards_to_go = self.reward_to_go(rewards, dones, gamma)
+                    with torch.no_grad():
+                        last_value = 0.0 if terminated else critic(torch.tensor(state, dtype=torch.float).to(self.device)).item()
 
-                    self.batch_buffer.extend(states, actions, values, rewards_to_go, log_probs)
+                    if advantage == "gae":
+                        advantages, returns = self.generalized_advantage_estimation(
+                            rewards=rewards,
+                            values=values,
+                            dones=dones,
+                            last_value=last_value,
+                            gamma=gamma,
+                            gae_lambda=gae_lambda,
+                        )
+                    else:
+                        returns = self.reward_to_go(rewards, dones, gamma, last_value=last_value)
+                        advantages = np.array(returns) - np.array(values).reshape(-1)
+
+                    self.batch_buffer.extend(states, actions, values, returns, log_probs, advantages)
 
                     if len(self.batch_buffer) >= batch_size:
                         batch_cache = self.batch_buffer.take()
                         
-                        batch_states, batch_actions, batch_values, batch_rewards_to_go, batch_old_log_probs = batch_cache
+                        batch_states, batch_actions, batch_values, batch_returns, batch_old_log_probs, batch_advantages = batch_cache
 
                         batch_states = torch.tensor(np.array(batch_states), dtype=torch.float).to(self.device)
                         batch_actions = torch.tensor(np.array(batch_actions), dtype=torch.int64).to(self.device)
                         batch_values = torch.tensor(np.array(batch_values), dtype=torch.float).to(self.device)
-                        batch_rewards_to_go = torch.tensor(np.array(batch_rewards_to_go), dtype=torch.float).to(self.device)
+                        batch_returns = torch.tensor(np.array(batch_returns), dtype=torch.float).to(self.device)
                         batch_old_log_probs = torch.tensor(np.array(batch_old_log_probs), dtype=torch.float).to(self.device)
+                        batch_advantages = torch.tensor(np.array(batch_advantages), dtype=torch.float).to(self.device)
 
-                        advantages = batch_rewards_to_go - batch_values.squeeze()
+                        if normalize_advantages:
+                            batch_advantages = (batch_advantages - batch_advantages.mean()) / (batch_advantages.std(unbiased=False) + 1e-9)
+
+                        current_mini_batch_size = len(batch_states) if mini_batch_size is None else mini_batch_size
+                        current_mini_batch_size = max(1, min(current_mini_batch_size, len(batch_states)))
 
                         for _ in range(ppo_epochs):
-                            probs = actor(batch_states)
-                            dist = Categorical(probs)
-                            new_log_probs = dist.log_prob(batch_actions) # The same as torch.log(probs)
-                            entropy = dist.entropy().mean()
+                            shuffled_indices = torch.randperm(len(batch_states), device=batch_states.device)
 
-                            ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                            surr1 = ratio * advantages
-                            surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * advantages
-                            actor_loss = -torch.min(surr1, surr2).mean()
+                            for start in range(0, len(batch_states), current_mini_batch_size):
+                                mini_batch_indices = shuffled_indices[start:start + current_mini_batch_size]
+                                mini_batch_states = batch_states[mini_batch_indices]
+                                mini_batch_actions = batch_actions[mini_batch_indices]
+                                mini_batch_returns = batch_returns[mini_batch_indices]
+                                mini_batch_old_log_probs = batch_old_log_probs[mini_batch_indices]
+                                mini_batch_advantages = batch_advantages[mini_batch_indices]
 
-                            critic_loss = criterion(critic(batch_states).squeeze(), batch_rewards_to_go)
+                                logits = actor(mini_batch_states)
+                                dist = Categorical(logits=logits)
+                                new_log_probs = dist.log_prob(mini_batch_actions)
+                                entropy = dist.entropy().mean()
 
-                            loss = actor_loss + value_coeff * critic_loss - entropy_coeff * entropy
+                                ratio = torch.exp(new_log_probs - mini_batch_old_log_probs)
+                                surr1 = ratio * mini_batch_advantages
+                                surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * mini_batch_advantages
+                                actor_loss = -torch.min(surr1, surr2).mean()
 
-                            actor_optimizer.zero_grad()
-                            critic_optimizer.zero_grad()
-                            loss.backward()
-                            actor_optimizer.step()
-                            critic_optimizer.step()
+                                critic_loss = criterion(critic(mini_batch_states).squeeze(-1), mini_batch_returns)
+
+                                loss = actor_loss + value_coeff * critic_loss - entropy_coeff * entropy
+
+                                actor_optimizer.zero_grad()
+                                critic_optimizer.zero_grad()
+                                loss.backward()
+                                actor_optimizer.step()
+                                critic_optimizer.step()
 
                         self.batch_buffer.reset()
 
                     break
 
-                step += 1
-
             scores_window.append(score)
             scores.append(score)
             tqdm_range.set_description(f"Score: {np.mean(scores_window)}")
+            if on_episode_end is not None:
+                on_episode_end(episode, score, scores)
 
         return scores
