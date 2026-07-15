@@ -26,7 +26,6 @@ class Actor(nn.Module):
             nn.Linear(128, 128),
             nn.ReLU(),
             nn.Linear(128, n_actions),
-            nn.Softmax(dim=-1)
         )
 
     def forward(self, x):
@@ -41,7 +40,7 @@ trainer.train(
     optimizer = optimizer,
     n_episodes = n_episodes,
     gamma = gamma,
-    batch_size=32
+    batch_size=32,
 )
     
 env.close()
@@ -51,12 +50,14 @@ env = gym.make("CartPole-v1", render_mode="human")
 
 def test(model: torch.nn.Module):
     state, info = env.reset()
-    terminated = False
-    while not terminated:
+    done = False
+    while not done:
         # action = trainer.policy(model, state)
-        action = torch.argmax(model(torch.tensor(state, dtype=torch.float32).to(device)))
+        with torch.no_grad():
+            action = torch.argmax(model(torch.tensor(state, dtype=torch.float32).to(device)))
 
-        state, reward, terminated, trancated, _ = env.step(action.item())
+        state, reward, terminated, truncated, _ = env.step(action.item())
+        done = terminated or truncated
         env.render()
 
 test(actor)

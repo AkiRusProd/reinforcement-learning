@@ -673,12 +673,13 @@ class VPGTrainer(BaseTrainer):
         self.batch_buffer = ExtendableBuffer()
 
     def policy(self, actor, state):
-        probs = actor(torch.tensor(state, dtype=torch.float).to(self.device))
-        dist = Categorical(probs)
-        action = dist.sample()
-        return action.cpu().detach().numpy()
-    
-    def reward_to_go(self, rewards, dones, gamma=1.0, noralize=False):
+        state = torch.tensor(state, dtype=torch.float).to(self.device)
+        with torch.no_grad():
+            dist = Categorical(logits=actor(state))
+            action = dist.sample()
+        return action.item()
+
+    def reward_to_go(self, rewards, dones, gamma=1.0, normalize=False):
         # https://subscription.packtpub.com/book/data/9781789533583/1/ch01lvl1sec05/identifying-reward-functions-and-the-concept-of-discounted-rewards
         # https://medium.com/iecse-hashtag/rl-part-2-returns-policy-and-value-functions-33311f16197
         rewards_to_go = []
@@ -693,7 +694,9 @@ class VPGTrainer(BaseTrainer):
 
         # rewards_to_go = np.array([np.sum(rewards[i:]*(1 - dones[i:])*(gamma**np.array(range(0, len(rewards)-i)))) for i in range(len(rewards))])
 
-        if noralize:
+        rewards_to_go = np.array(rewards_to_go, dtype=np.float32)
+
+        if normalize:
             rewards_to_go = (rewards_to_go - np.mean(rewards_to_go)) / (np.std(rewards_to_go) + 1e-9)
 
         return rewards_to_go
@@ -708,6 +711,9 @@ class VPGTrainer(BaseTrainer):
         max_steps: int = None,
         
     ):
+        actor.to(self.device)
+        actor.train()
+
         tqdm_range = tqdm(range(n_episodes), total=n_episodes)
 
         self.batch_buffer.reset()
@@ -721,7 +727,7 @@ class VPGTrainer(BaseTrainer):
             step = 0
             while True:
                 action = self.policy(actor, state)
-                next_state, reward, terminated, truncated, _ = self.env.step(action.item())
+                next_state, reward, terminated, truncated, _ = self.env.step(action)
 
                 done = terminated or truncated
 
@@ -730,8 +736,10 @@ class VPGTrainer(BaseTrainer):
                 score += reward
 
                 state = next_state
+                step += 1
 
-                if done or step == max_steps:
+                max_steps_reached = max_steps is not None and step >= max_steps
+                if done or max_steps_reached:
                     cache = self.buffer.take()
                     states, actions, rewards, dones = map(np.array, zip(*cache))
 
@@ -741,15 +749,15 @@ class VPGTrainer(BaseTrainer):
 
                     if len(self.batch_buffer) >= batch_size:
                         batch_cache = self.batch_buffer.take()
-
+                  
                         batch_states, batch_actions, batch_rewards_to_go = batch_cache
 
                         batch_states = torch.tensor(np.array(batch_states), dtype=torch.float).to(self.device)
                         batch_actions = torch.tensor(np.array(batch_actions), dtype=torch.int64).to(self.device)
                         batch_rewards_to_go = torch.tensor(np.array(batch_rewards_to_go), dtype=torch.float).to(self.device)
 
-                        logprobs = torch.log(actor(batch_states))
-                        actions_logprobs = batch_rewards_to_go * torch.gather(logprobs, 1, batch_actions.unsqueeze(1)).squeeze() # or logprob[torch.arange(len(logprob)), batch_actions].squeeze()
+                        dist = Categorical(logits=actor(batch_states))
+                        actions_logprobs = batch_rewards_to_go * dist.log_prob(batch_actions)
 
                         loss = -actions_logprobs.mean()
 
@@ -760,10 +768,6 @@ class VPGTrainer(BaseTrainer):
                         self.batch_buffer.reset()
 
                     break
-                       
-                  
-
-                step += 1
             
             scores.append(score)
             scores_window.append(score)   
