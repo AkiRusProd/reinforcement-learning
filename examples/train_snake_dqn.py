@@ -16,8 +16,8 @@ env = SnakeGameEnvironment(
     speed=10000
 )
 
-trainer = DQNTrainer(env) # Without memory
-# trainer = DQNTrainer(env, memory=ReplayMemory(memory_size=256, batch_size=8)) # With memory (uncomment this line)
+# trainer = DQNTrainer(env) # Without memory (uncomment this line)
+trainer = DQNTrainer(env, memory=ReplayMemory(memory_size=256, batch_size=8)) # With memory
 
 n_episodes = 300
 learning_rate = 0.005#0.005

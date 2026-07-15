@@ -116,7 +116,8 @@ class DQNTrainer(BaseTrainer):
 
     def greedy_policy(self, model, state: tuple[int, int]) -> int:
         state = torch.tensor(state, dtype=torch.float).to(self.device)
-        return torch.argmax(model(state))    
+        with torch.no_grad():
+            return torch.argmax(model(state)).item()
         
     def train(
         self,
@@ -131,11 +132,25 @@ class DQNTrainer(BaseTrainer):
         min_epsilon: float = None,
         decay_rate: float = None,
         decay_epsilon: str = "constant",
+        target_model: torch.nn.Module = None,
+        tau: float = 1.0,
+        n_steps_update: int = 100,
     ) -> np.ndarray:
+        assert 1 >= tau >= 0
+        assert n_steps_update > 0
+
         tqdm_range = tqdm(range(n_episodes), total=n_episodes)
+
+        if target_model is None:
+            target_model = copy.deepcopy(model)
+        else:
+            target_model.load_state_dict(model.state_dict())
+        target_model.to(self.device)
+        target_model.eval()
 
         scores = []
         scores_window = deque(maxlen = 100)
+        global_step = 0
         for episode in tqdm_range:
             state, _ = self.env.reset()
 
@@ -144,13 +159,14 @@ class DQNTrainer(BaseTrainer):
             step = 0
             score = 0
             while True:
-                action = self.epsilon_greedy_policy(model, state, epsilon)
+                action = int(self.epsilon_greedy_policy(model, state, epsilon))
                 
-                next_state, reward, terminated, truncated, _  = self.env.step(action.item())
+                next_state, reward, terminated, truncated, _  = self.env.step(action)
 
                 done = terminated or truncated
                 score += reward
 
+                trained = False
                 if self.memory is not None:
                     self.memory.add(state, action, reward, next_state, done)
 
@@ -160,15 +176,22 @@ class DQNTrainer(BaseTrainer):
                         # for transition in transitions:
                         #     self._train(model, optimizer, criterion, gamma, transition)
 
-                        self._batch_train(model, optimizer, criterion, gamma, transitions)
+                        self._batch_train(model, target_model, optimizer, criterion, gamma, transitions)
+                        trained = True
                 else:
                     self._train(
                         model=model,
+                        target_model=target_model,
                         optimizer=optimizer,
                         criterion=criterion,
                         gamma=gamma,
                         transition=(state, action, reward, next_state, done),
                     )
+                    trained = True
+
+                global_step += 1
+                if trained and global_step % n_steps_update == 0:
+                    self._soft_update(target_model, model, tau)
 
                 state = next_state
 
@@ -182,10 +205,18 @@ class DQNTrainer(BaseTrainer):
             tqdm_range.set_description(f"Score: {np.mean(scores_window):.3f}")
 
         return scores
+
+    def _soft_update(self, target: torch.nn.Module, source: torch.nn.Module, tau: float):
+        with torch.no_grad():
+            for target_param, source_param in zip(target.parameters(), source.parameters()):
+                target_param.data.copy_(source_param.data*tau + target_param.data*(1-tau))
+            for target_buffer, source_buffer in zip(target.buffers(), source.buffers()):
+                target_buffer.copy_(source_buffer)
     
     def _train(
         self,
         model: torch.nn.Module,
+        target_model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         criterion: torch.nn.modules.loss._Loss,
         gamma,
@@ -193,17 +224,17 @@ class DQNTrainer(BaseTrainer):
     ):
         state, action, reward, next_state, done = transition
         prediction = model(torch.tensor(state, dtype=torch.float).to(self.device))
-        target = prediction.clone()
-        
-        if not done:
-            q = reward + gamma * torch.max(model(torch.tensor(next_state, dtype=torch.float).to(self.device)))
-        else:
-            q = reward
+        action = int(action)
+        q_prediction = prediction[action]
+        q_target = torch.tensor(reward, dtype=torch.float, device=self.device)
 
-        target[action] = q
+        if not done:
+            next_state_tensor = torch.tensor(next_state, dtype=torch.float).to(self.device)
+            with torch.no_grad():
+                q_target = q_target + gamma * torch.max(target_model(next_state_tensor))
 
         optimizer.zero_grad()
-        loss = criterion(prediction, target)
+        loss = criterion(q_prediction, q_target)
         loss.backward()
         optimizer.step()
 
@@ -212,6 +243,7 @@ class DQNTrainer(BaseTrainer):
     def _batch_train(
         self,
         model: torch.nn.Module,
+        target_model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         criterion: torch.nn.modules.loss._Loss,
         gamma,
@@ -221,23 +253,20 @@ class DQNTrainer(BaseTrainer):
         
         states_tensor = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
         next_states_tensor = torch.tensor(np.array(next_states), dtype=torch.float).to(self.device)
+        actions_tensor = torch.tensor([int(action) for action in actions], dtype=torch.int64).to(self.device)
         rewards_tensor = torch.tensor(rewards, dtype=torch.float).to(self.device)
         dones_tensor = torch.tensor(dones, dtype=torch.bool).to(self.device)
         
-        prediction = model(states_tensor)
-        
-        target = prediction.clone()
-        
-        next_state_values = model(next_states_tensor)
+        predictions = model(states_tensor)
+        q_predictions = predictions.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
 
-        max_next_state_values = torch.max(next_state_values, dim=1)[0]
-
-        q_values = rewards_tensor + gamma * max_next_state_values * (~dones_tensor)
-        
-        target[range(len(actions)), actions] = q_values
+        with torch.no_grad():
+            next_state_values = target_model(next_states_tensor)
+            max_next_state_values = torch.max(next_state_values, dim=1)[0]
+            q_targets = rewards_tensor + gamma * max_next_state_values * (~dones_tensor).float()
         
         optimizer.zero_grad()
-        loss = criterion(prediction, target.detach())
+        loss = criterion(q_predictions, q_targets)
         loss.backward()
         optimizer.step()
 
@@ -252,7 +281,8 @@ class DDQNTrainer(BaseTrainer):
 
     def greedy_policy(self, model, state: tuple[int, int]) -> int:
         state = torch.tensor(state, dtype=torch.float).to(self.device)
-        return torch.argmax(model(state))    
+        with torch.no_grad():
+            return torch.argmax(model(state)).item()
                 
     def train(
         self,
@@ -271,10 +301,18 @@ class DDQNTrainer(BaseTrainer):
         decay_epsilon: str = "constant",
         n_steps_update: int = 1,
     ) -> np.ndarray:
+        assert 1 >= tau >= 0
+        assert n_steps_update > 0
+
         tqdm_range = tqdm(range(n_episodes), total=n_episodes)
+
+        target_model.to(self.device)
+        target_model.load_state_dict(online_model.state_dict())
+        target_model.eval()
 
         scores = []
         scores_window = deque(maxlen = 100)
+        global_step = 0
         for episode in tqdm_range:
             state, _ = self.env.reset()
 
@@ -283,15 +321,17 @@ class DDQNTrainer(BaseTrainer):
             score = 0
             step = 0
             while True:
-                action: int = self.epsilon_greedy_policy(online_model, state, epsilon)
+                action = int(self.epsilon_greedy_policy(online_model, state, epsilon))
 
-                next_state, reward, terminated, truncated, _  = self.env.step(action.item())
+                next_state, reward, terminated, truncated, _  = self.env.step(action)
 
-                done = terminated or truncated
+                done = terminated
+                episode_done = terminated or truncated
                 score += reward
 
+                trained = False
                 if self.memory is not None:
-                    self.memory.add( state, action, reward, next_state, done)
+                    self.memory.add(state, action, reward, next_state, done)
 
                     if len(self.memory) >= self.memory.batch_size:
                         transitions = self.memory.sample()
@@ -307,6 +347,7 @@ class DDQNTrainer(BaseTrainer):
                             gamma=gamma,
                             transitions=transitions
                         )
+                        trained = True
 
                 else:
                     self._train(
@@ -317,17 +358,19 @@ class DDQNTrainer(BaseTrainer):
                         gamma=gamma,
                         transition=(state, action, reward, next_state, done),
                     )
+                    trained = True
                 
-                if step % n_steps_update == 0:
+                global_step += 1
+                if trained and global_step % n_steps_update == 0:
                     self._soft_update(target_model, online_model, tau)
 
                 state = next_state
+                step += 1
 
-                if done or step == max_steps:
+                max_steps_reached = max_steps is not None and step >= max_steps
+                if episode_done or max_steps_reached:
                     break
 
-                step += 1
-            
             scores.append(score)
             scores_window.append(score)   
             tqdm_range.set_description(f"Score: {np.mean(scores_window):.3f}")
@@ -335,11 +378,11 @@ class DDQNTrainer(BaseTrainer):
         return scores
     
     def _soft_update(self, target: torch.nn.Module, source: torch.nn.Module, tau: float):
-        target_weights = target.state_dict()
-        source_weights = source.state_dict()
-        for key in source_weights:
-            target_weights[key] = source_weights[key]*tau + target_weights[key]*(1-tau)
-        target.load_state_dict(target_weights)
+        with torch.no_grad():
+            for target_param, source_param in zip(target.parameters(), source.parameters()):
+                target_param.data.copy_(source_param.data*tau + target_param.data*(1-tau))
+            for target_buffer, source_buffer in zip(target.buffers(), source.buffers()):
+                target_buffer.copy_(source_buffer)
     
     def _train(
         self,
@@ -352,17 +395,18 @@ class DDQNTrainer(BaseTrainer):
     ):
         state, action, reward, next_state, done = transition
         prediction = online_model(torch.tensor(state, dtype=torch.float).to(self.device))
-        
-        if not done:
-            q = reward + gamma * torch.max(target_model(torch.tensor(next_state, dtype=torch.float).to(self.device)))
-        else:
-            q = reward
+        action = int(action)
+        q_prediction = prediction[action]
+        q_target = torch.tensor(reward, dtype=torch.float, device=self.device)
 
-        target = prediction.clone()
-        target[action] = q
+        if not done:
+            next_state_tensor = torch.tensor(next_state, dtype=torch.float).to(self.device)
+            with torch.no_grad():
+                next_action = torch.argmax(online_model(next_state_tensor))
+                q_target = q_target + gamma * target_model(next_state_tensor)[next_action]
 
         optimizer.zero_grad()
-        loss = criterion(prediction, target.detach())
+        loss = criterion(q_prediction, q_target)
         loss.backward()
         optimizer.step()
 
@@ -380,23 +424,21 @@ class DDQNTrainer(BaseTrainer):
         
         states_tensor = torch.tensor(np.array(states), dtype=torch.float).to(self.device)
         next_states_tensor = torch.tensor(np.array(next_states), dtype=torch.float).to(self.device)
+        actions_tensor = torch.tensor([int(action) for action in actions], dtype=torch.int64).to(self.device)
         rewards_tensor = torch.tensor(rewards, dtype=torch.float).to(self.device)
         dones_tensor = torch.tensor(dones, dtype=torch.bool).to(self.device)
 
         predictions = online_model(states_tensor)
+        q_predictions = predictions.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
 
-        next_state_values = target_model(next_states_tensor)
-
-        max_next_state_values = torch.max(next_state_values, dim=1)[0]
-
-        q_values = rewards_tensor + (1 - dones_tensor.float()) * gamma * max_next_state_values
-
-        targets = predictions.clone()
-
-        targets[range(len(actions)), actions] = q_values
+        with torch.no_grad():
+            next_actions = torch.argmax(online_model(next_states_tensor), dim=1, keepdim=True)
+            next_state_values = target_model(next_states_tensor)
+            next_q_values = next_state_values.gather(1, next_actions).squeeze(1)
+            q_targets = rewards_tensor + (1 - dones_tensor.float()) * gamma * next_q_values
 
         optimizer.zero_grad()
-        loss = criterion(predictions, targets)
+        loss = criterion(q_predictions, q_targets)
         loss.backward()
         optimizer.step()
 
