@@ -81,6 +81,14 @@ class QLearningTrainer(BaseTrainer):
         decay_rate: float = None,
         decay_epsilon: str = "constant",
     ) -> np.ndarray:
+        if decay_epsilon == "constant":
+            assert epsilon is not None, "epsilon must be provided when decay_epsilon is 'constant'"
+        else:
+            assert decay_epsilon in self.epsilon_decays, f"Unknown epsilon decay: {decay_epsilon}"
+            assert max_epsilon is not None, "max_epsilon must be provided when epsilon decay is enabled"
+            assert min_epsilon is not None, "min_epsilon must be provided when epsilon decay is enabled"
+            assert decay_rate is not None, "decay_rate must be provided when epsilon decay is enabled"
+
         for episode in tqdm(range(n_episodes), total=n_episodes):
             state, _ = self.env.reset()
 
@@ -91,19 +99,20 @@ class QLearningTrainer(BaseTrainer):
                 action = self.epsilon_greedy_policy(q_table, state, epsilon)
 
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
-                done = terminated or truncated
+                episode_done = terminated or truncated
+                next_q = 0 if terminated else np.max(q_table[next_state])
 
                 # The Bellman Equation
                 q_table[state][action] += learning_rate * (
-                    reward + gamma * np.max(q_table[next_state]) - q_table[state][action]
+                    reward + gamma * next_q - q_table[state][action]
                 )
 
                 state = next_state
-
-                if done or step == max_steps:
-                    break
-
                 step += 1
+
+                max_steps_reached = max_steps is not None and step >= max_steps
+                if episode_done or max_steps_reached:
+                    break
 
         return q_table
 
@@ -460,6 +469,14 @@ class SARSATrainer(BaseTrainer):
         decay_rate: float = None,
         decay_epsilon: str = "constant",
     ) -> np.ndarray:
+        if decay_epsilon == "constant":
+            assert epsilon is not None, "epsilon must be provided when decay_epsilon is 'constant'"
+        else:
+            assert decay_epsilon in self.epsilon_decays, f"Unknown epsilon decay: {decay_epsilon}"
+            assert max_epsilon is not None, "max_epsilon must be provided when epsilon decay is enabled"
+            assert min_epsilon is not None, "min_epsilon must be provided when epsilon decay is enabled"
+            assert decay_rate is not None, "decay_rate must be provided when epsilon decay is enabled"
+
         for episode in tqdm(range(n_episodes), total=n_episodes):
             state, _ = self.env.reset()
 
@@ -469,22 +486,27 @@ class SARSATrainer(BaseTrainer):
             step = 0
             while True:
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
-                done = terminated or truncated
+                episode_done = terminated or truncated
 
                 # SARSA Update
-                next_action = self.epsilon_greedy_policy(q_table, next_state, epsilon)
+                next_action = None
+                if terminated:
+                    next_q = 0
+                else:
+                    next_action = self.epsilon_greedy_policy(q_table, next_state, epsilon)
+                    next_q = q_table[next_state][next_action]
 
                 q_table[state][action] += learning_rate * (
-                    reward + gamma * q_table[next_state][next_action] - q_table[state][action]
+                    reward + gamma * next_q - q_table[state][action]
                 )
 
                 state = next_state
                 action = next_action
-
-                if done or step == max_steps:
-                    break
-
                 step += 1
+
+                max_steps_reached = max_steps is not None and step >= max_steps
+                if episode_done or max_steps_reached:
+                    break
 
         return q_table
 

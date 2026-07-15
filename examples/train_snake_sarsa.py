@@ -1,4 +1,4 @@
-# Run with `python3 -m examples.train_snake_ql`
+# Run with `python3 -m examples.train_snake_sarsa`
 import os
 import numpy as np
 from src.envs import SnakeGameEnvironment

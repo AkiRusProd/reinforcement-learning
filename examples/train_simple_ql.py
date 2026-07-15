@@ -27,6 +27,7 @@ q_table = trainer.train(
     epsilon = epsilon,
     learning_rate = learning_rate,
     gamma = gamma,
+    max_steps = max_steps,
 )
 
 if not os.path.exists("saves"):
