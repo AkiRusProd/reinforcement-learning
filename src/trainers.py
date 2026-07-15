@@ -519,12 +519,16 @@ class DDPGTrainer(BaseTrainer):
         assert self.memory is not None, "Memory cannot be None"
 
     def apply_noise(self, action, noise):
-        lower_bound = self.env.action_space.low.item()
-        upper_bound = self.env.action_space.high.item()
-        return np.clip(action + noise, lower_bound, upper_bound)
+        action = np.asarray(action, dtype=np.float32)
+        noise = np.asarray(noise, dtype=np.float32)
+        return np.clip(action + noise, self.env.action_space.low, self.env.action_space.high)
     
     def policy(self, actor, state):
-        return actor(torch.tensor(state, dtype=torch.float).to(self.device)).cpu().detach().numpy()
+        state = torch.tensor(state, dtype=torch.float).to(self.device)
+        with torch.no_grad():
+            action = actor(state).cpu().numpy()
+        return np.asarray(action, dtype=np.float32)
+
     def train(
         self,
         actor,
@@ -540,7 +544,20 @@ class DDPGTrainer(BaseTrainer):
         tau = 0.005,
         max_steps: int = None,
     ) -> np.ndarray:
+        assert 1 >= tau >= 0
+
         tqdm_range = tqdm(range(n_episodes), total=n_episodes)
+
+        actor.to(self.device)
+        critic.to(self.device)
+        actor_target.to(self.device)
+        critic_target.to(self.device)
+        actor.train()
+        critic.train()
+        actor_target.load_state_dict(actor.state_dict())
+        critic_target.load_state_dict(critic.state_dict())
+        actor_target.eval()
+        critic_target.eval()
 
         scores = []
         scores_window = deque(maxlen = 100)
@@ -555,12 +572,13 @@ class DDPGTrainer(BaseTrainer):
   
                 action = self.apply_noise(action, noise.sample())
 
-                next_state, reward, terminated, truncated, _ = self.env.step([action.item()])
+                next_state, reward, terminated, truncated, _ = self.env.step(action)
 
-                done = terminated or truncated
+                done = terminated
+                episode_done = terminated or truncated
                 score += reward
 
-                self.memory.add( state, action, [reward], next_state, [done])
+                self.memory.add(state, action, reward, next_state, done)
 
                 if len(self.memory) >= self.memory.batch_size:
                     transitions = self.memory.sample()
@@ -577,15 +595,15 @@ class DDPGTrainer(BaseTrainer):
                         transitions=transitions
                     )
 
-                self._soft_update(actor_target, actor, tau)
-                self._soft_update(critic_target, critic, tau)
+                    self._soft_update(actor_target, actor, tau)
+                    self._soft_update(critic_target, critic, tau)
 
                 state = next_state
-
-                if done or step == max_steps:
-                    break
-
                 step += 1
+
+                max_steps_reached = max_steps is not None and step >= max_steps
+                if episode_done or max_steps_reached:
+                    break
             
             scores.append(score)
             scores_window.append(score)   
@@ -608,18 +626,26 @@ class DDPGTrainer(BaseTrainer):
         states, actions, rewards, next_states, dones = map(list, zip(*transitions))
         
         states = torch.tensor(np.array(states), dtype=torch.float).to(self.device)
-        actions = torch.tensor(np.array(actions), dtype=torch.float).to(self.device)
+        actions = torch.tensor(np.array(actions), dtype=torch.float).to(self.device).reshape(len(states), -1)
         next_states = torch.tensor(np.array(next_states), dtype=torch.float).to(self.device)
-        rewards = torch.tensor(rewards, dtype=torch.float).to(self.device)
-        dones = torch.tensor(dones, dtype=torch.float).to(self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float).to(self.device).reshape(-1, 1)
+        dones = torch.tensor(dones, dtype=torch.float).to(self.device).reshape(-1, 1)
        
         critic_values = critic(states, actions)
 
-        next_actions = actor_target(next_states)
-        next_q_values = critic_target(next_states, next_actions.detach())
-        y = rewards + gamma * (1 - dones) * next_q_values
+        with torch.no_grad():
+            next_actions = actor_target(next_states)
+            next_q_values = critic_target(next_states, next_actions)
+            y = rewards + gamma * (1 - dones) * next_q_values
         
-        critic_loss = criterion(y, critic_values)
+        critic_loss = criterion(critic_values, y)
+
+        critic_optimizer.zero_grad()
+        critic_loss.backward()
+        critic_optimizer.step()
+
+        for parameter in critic.parameters():
+            parameter.requires_grad = False
 
         policy_loss = -critic(states, actor(states)).mean()
 
@@ -627,17 +653,16 @@ class DDPGTrainer(BaseTrainer):
         policy_loss.backward()
         actor_optimizer.step()
 
-        critic_optimizer.zero_grad()
-        critic_loss.backward()
-        critic_optimizer.step()
+        for parameter in critic.parameters():
+            parameter.requires_grad = True
 
         
     def _soft_update(self, target: torch.nn.Module, source: torch.nn.Module, tau: float):
-        target_weights = target.state_dict()
-        source_weights = source.state_dict()
-        for key in source_weights:
-            target_weights[key] = source_weights[key]*tau + target_weights[key]*(1-tau)
-        target.load_state_dict(target_weights)
+        with torch.no_grad():
+            for target_param, source_param in zip(target.parameters(), source.parameters()):
+                target_param.data.copy_(source_param.data*tau + target_param.data*(1-tau))
+            for target_buffer, source_buffer in zip(target.buffers(), source.buffers()):
+                target_buffer.copy_(source_buffer)
 
 
 class VPGTrainer(BaseTrainer):

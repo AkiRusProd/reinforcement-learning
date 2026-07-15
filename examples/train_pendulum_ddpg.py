@@ -40,7 +40,7 @@ class Critic(nn.Module):
         super().__init__()
         self.layer1 = nn.Linear(n_observations + n_actions, 256)
         self.layer2 = nn.Linear(256, 256)
-        self.layer3 = nn.Linear(256, n_actions)
+        self.layer3 = nn.Linear(256, 1)
     def forward(self, state, action):
         x = torch.cat([state, action], 1)
         x = F.relu(self.layer1(x))
@@ -93,10 +93,11 @@ env = gym.make("Pendulum-v1", render_mode="human")
 
 def test(model: torch.nn.Module):
     state, info = env.reset()
-    terminated = False
-    while not terminated:
+    done = False
+    while not done:
         action = trainer.policy(model, state)
-        state, reward, terminated, trancated, _ = env.step([action.item()])
+        state, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
         env.render()
 
 test(actor)
