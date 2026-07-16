@@ -788,26 +788,24 @@ class A2CTrainer(BaseTrainer):
     def policy(self, actor, critic, state):
         state = torch.tensor(state, dtype=torch.float).to(self.device)
 
-        probs = actor(state)
-        dist = Categorical(probs)
+        logits = actor(state)
+        dist = Categorical(logits=logits)
         action = dist.sample()
 
         value = critic(state)
 
-        entropy = dist.entropy().mean()
-
         return action.cpu().detach().numpy(), value.cpu().detach().numpy()
     
-    def reward_to_go(self, rewards, dones, gamma=1.0, noralize=False):
+    def reward_to_go(self, rewards, dones, gamma=1.0, normalize=False, last_value=0.0):
         # https://subscription.packtpub.com/book/data/9781789533583/1/ch01lvl1sec05/identifying-reward-functions-and-the-concept-of-discounted-rewards
         # https://medium.com/iecse-hashtag/rl-part-2-returns-policy-and-value-functions-33311f16197
         rewards_to_go = []
-        cumulative_reward = 0
+        cumulative_reward = last_value
         for reward, done in zip(reversed(rewards), reversed(dones)):
             cumulative_reward = reward + gamma * (1 - done) * cumulative_reward
             rewards_to_go.insert(0, cumulative_reward)
 
-        if noralize:
+        if normalize:
             rewards_to_go = (rewards_to_go - np.mean(rewards_to_go)) / (np.std(rewards_to_go) + 1e-9)
 
         return rewards_to_go
@@ -826,7 +824,6 @@ class A2CTrainer(BaseTrainer):
         value_coeff: float = 0.5,
         entropy_coeff: float = 0.01,
         max_steps: int = None,
-        
     ):
         tqdm_range = tqdm(range(n_episodes), total=n_episodes)
 
@@ -845,17 +842,23 @@ class A2CTrainer(BaseTrainer):
 
                 done = terminated or truncated
 
-                self.buffer.add(state, action, value, reward, done)
+                self.buffer.add(state, action, value, reward, terminated)
 
                 score += reward
 
                 state = next_state
+                step += 1
 
-                if done or step == max_steps:
+                max_steps_reached = max_steps is not None and step >= max_steps
+
+                if done or max_steps_reached:
                     cache = self.buffer.take()
                     states, actions, values, rewards, dones = map(np.array, zip(*cache))
 
-                    rewards_to_go = self.reward_to_go(rewards, dones, gamma)
+                    with torch.no_grad():
+                        last_value = 0.0 if terminated else critic(torch.tensor(state, dtype=torch.float).to(self.device)).item()
+
+                    rewards_to_go = self.reward_to_go(rewards, dones, gamma, last_value=last_value)
 
                     self.batch_buffer.extend(states, actions, values, rewards_to_go)
 
@@ -869,18 +872,17 @@ class A2CTrainer(BaseTrainer):
                         batch_values = torch.tensor(np.array(batch_values), dtype=torch.float).to(self.device)
                         batch_rewards_to_go = torch.tensor(np.array(batch_rewards_to_go), dtype=torch.float).to(self.device)
                       
-                        probs = actor(batch_states)
-                        dist = Categorical(probs)
+                        logits = actor(batch_states)
+                        dist = Categorical(logits=logits)
                         entropy = dist.entropy().mean()
 
 
-                        advantages = batch_rewards_to_go - batch_values.squeeze()
+                        advantages = batch_rewards_to_go - batch_values.squeeze(-1)
                         
-                        logprobs = torch.log(actor(batch_states))
-                        actions_logprobs = advantages * torch.gather(logprobs, 1, batch_actions.unsqueeze(1)).squeeze() # or logprob[torch.arange(len(logprob)), batch_actions].squeeze()
+                        actions_logprobs = advantages * dist.log_prob(batch_actions)
                         actor_loss = -actions_logprobs.mean()
 
-                        critic_loss = criterion(critic(batch_states).squeeze(), batch_rewards_to_go)
+                        critic_loss = criterion(critic(batch_states).squeeze(-1), batch_rewards_to_go)
 
                         loss = actor_loss + value_coeff * critic_loss - entropy_coeff * entropy
 
@@ -893,8 +895,6 @@ class A2CTrainer(BaseTrainer):
                         self.batch_buffer.reset()
 
                     break
-
-                step += 1
 
             scores_window.append(score)
             scores.append(score)

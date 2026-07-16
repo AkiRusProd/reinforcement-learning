@@ -29,8 +29,7 @@ class Actor(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(64, n_actions),
-            nn.Softmax(dim=-1)
+            nn.Linear(64, n_actions)
         )
 
     def forward(self, x):
