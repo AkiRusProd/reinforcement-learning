@@ -782,19 +782,17 @@ class A2CTrainer(BaseTrainer):
     def __init__(self, env: BaseEnvironment, device = None) -> None:
         super().__init__(env)
         self.device = device
-        self.buffer = Buffer()
-        self.batch_buffer = ExtendableBuffer()
 
     def policy(self, actor, critic, state):
-        state = torch.tensor(state, dtype=torch.float).to(self.device)
+        state = torch.as_tensor(state, dtype=torch.float, device=self.device)
 
-        logits = actor(state)
-        dist = Categorical(logits=logits)
-        action = dist.sample()
+        with torch.no_grad():
+            logits = actor(state)
+            dist = Categorical(logits=logits)
+            action = dist.sample()
+            value = critic(state).squeeze(-1)
 
-        value = critic(state)
-
-        return action.cpu().detach().numpy(), value.cpu().detach().numpy()
+        return action.cpu().numpy(), value.cpu().numpy()
     
     def reward_to_go(self, rewards, dones, gamma=1.0, normalize=False, last_value=0.0):
         # https://subscription.packtpub.com/book/data/9781789533583/1/ch01lvl1sec05/identifying-reward-functions-and-the-concept-of-discounted-rewards
@@ -806,6 +804,7 @@ class A2CTrainer(BaseTrainer):
             rewards_to_go.insert(0, cumulative_reward)
 
         if normalize:
+            rewards_to_go = np.asarray(rewards_to_go, dtype=np.float32)
             rewards_to_go = (rewards_to_go - np.mean(rewards_to_go)) / (np.std(rewards_to_go) + 1e-9)
 
         return rewards_to_go
@@ -819,86 +818,134 @@ class A2CTrainer(BaseTrainer):
         actor_optimizer: torch.optim.Optimizer,
         critic_optimizer: torch.optim.Optimizer,
         n_episodes: int,
-        batch_size: int,
+        batch_size: int = None,
         gamma: float = 0.99,
         value_coeff: float = 0.5,
         entropy_coeff: float = 0.01,
         max_steps: int = None,
+        n_steps: int = None,
+        gae_lambda: float = 1.0,
+        normalize_advantages: bool = True,
+        max_grad_norm: float = 0.5,
     ):
-        tqdm_range = tqdm(range(n_episodes), total=n_episodes)
+        if n_steps is None:
+            n_steps = batch_size if batch_size is not None else 5
+        elif batch_size is not None and batch_size != n_steps:
+            raise ValueError("batch_size and n_steps must match when both are provided")
 
-        self.batch_buffer.reset()
+        if n_steps <= 0:
+            raise ValueError("n_steps must be greater than zero")
+        if not 0.0 <= gae_lambda <= 1.0:
+            raise ValueError("gae_lambda must be between 0 and 1")
+
+        actor.train()
+        critic.train()
+
+        tqdm_range = tqdm(range(n_episodes), total=n_episodes)
         scores = []
         scores_window = deque(maxlen = 100)
-        for episode in tqdm_range:
+        for _ in tqdm_range:
             state, _ = self.env.reset()
-            self.buffer.reset()
 
             score = 0
             step = 0
+            episode_done = False
             while True:
-                action, value = self.policy(actor, critic, state)
-                next_state, reward, terminated, truncated, _ = self.env.step(action.item())
+                rollout_states = []
+                rollout_actions = []
+                rollout_rewards = []
+                rollout_values = []
+                rollout_terminated = []
 
-                done = terminated or truncated
+                for _ in range(n_steps):
+                    action, value = self.policy(actor, critic, state)
+                    next_state, reward, terminated, truncated, _ = self.env.step(action.item())
 
-                self.buffer.add(state, action, value, reward, terminated)
+                    rollout_states.append(state)
+                    rollout_actions.append(action.item())
+                    rollout_rewards.append(reward)
+                    rollout_values.append(value.item())
+                    rollout_terminated.append(terminated)
 
-                score += reward
+                    score += reward
+                    state = next_state
+                    step += 1
 
-                state = next_state
-                step += 1
+                    max_steps_reached = max_steps is not None and step >= max_steps
+                    episode_done = terminated or truncated or max_steps_reached
+                    if episode_done:
+                        break
 
-                max_steps_reached = max_steps is not None and step >= max_steps
+                with torch.no_grad():
+                    if terminated:
+                        last_value = 0.0
+                    else:
+                        last_state = torch.as_tensor(state, dtype=torch.float, device=self.device)
+                        last_value = critic(last_state).squeeze(-1).item()
 
-                if done or max_steps_reached:
-                    cache = self.buffer.take()
-                    states, actions, values, rewards, dones = map(np.array, zip(*cache))
+                batch_rewards = torch.as_tensor(
+                    rollout_rewards, dtype=torch.float, device=self.device
+                )
+                batch_values = torch.as_tensor(
+                    rollout_values, dtype=torch.float, device=self.device
+                )
+                batch_terminated = torch.as_tensor(
+                    rollout_terminated, dtype=torch.float, device=self.device
+                )
 
-                    with torch.no_grad():
-                        last_value = 0.0 if terminated else critic(torch.tensor(state, dtype=torch.float).to(self.device)).item()
+                advantages = torch.zeros_like(batch_rewards)
+                next_value = torch.as_tensor(last_value, dtype=torch.float, device=self.device)
+                next_advantage = torch.zeros((), dtype=torch.float, device=self.device)
+                for index in reversed(range(len(rollout_rewards))):
+                    non_terminal = 1.0 - batch_terminated[index]
+                    delta = (
+                        batch_rewards[index]
+                        + gamma * non_terminal * next_value
+                        - batch_values[index]
+                    )
+                    next_advantage = (
+                        delta
+                        + gamma * gae_lambda * non_terminal * next_advantage
+                    )
+                    advantages[index] = next_advantage
+                    next_value = batch_values[index]
 
-                    rewards_to_go = self.reward_to_go(rewards, dones, gamma, last_value=last_value)
+                returns = advantages + batch_values
+                policy_advantages = advantages
+                if normalize_advantages and len(policy_advantages) > 1:
+                    policy_advantages = (
+                        policy_advantages - policy_advantages.mean()
+                    ) / (policy_advantages.std(unbiased=False) + 1e-8)
 
-                    self.batch_buffer.extend(states, actions, values, rewards_to_go)
+                batch_states = torch.as_tensor(
+                    np.array(rollout_states), dtype=torch.float, device=self.device
+                )
+                batch_actions = torch.as_tensor(
+                    rollout_actions, dtype=torch.int64, device=self.device
+                )
 
-                    if len(self.batch_buffer) >= batch_size:
-                        batch_cache = self.batch_buffer.take()
+                dist = Categorical(logits=actor(batch_states))
+                actor_loss = -(dist.log_prob(batch_actions) * policy_advantages).mean()
+                entropy = dist.entropy().mean()
+                current_values = critic(batch_states).squeeze(-1)
+                critic_loss = criterion(current_values, returns)
+                loss = actor_loss + value_coeff * critic_loss - entropy_coeff * entropy
 
-                        batch_states, batch_actions, batch_values, batch_rewards_to_go = batch_cache
+                actor_optimizer.zero_grad()
+                critic_optimizer.zero_grad()
+                loss.backward()
+                if max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(actor.parameters(), max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
+                actor_optimizer.step()
+                critic_optimizer.step()
 
-                        batch_states = torch.tensor(np.array(batch_states), dtype=torch.float).to(self.device)
-                        batch_actions = torch.tensor(np.array(batch_actions), dtype=torch.int64).to(self.device)
-                        batch_values = torch.tensor(np.array(batch_values), dtype=torch.float).to(self.device)
-                        batch_rewards_to_go = torch.tensor(np.array(batch_rewards_to_go), dtype=torch.float).to(self.device)
-                      
-                        logits = actor(batch_states)
-                        dist = Categorical(logits=logits)
-                        entropy = dist.entropy().mean()
-
-
-                        advantages = batch_rewards_to_go - batch_values.squeeze(-1)
-                        
-                        actions_logprobs = advantages * dist.log_prob(batch_actions)
-                        actor_loss = -actions_logprobs.mean()
-
-                        critic_loss = criterion(critic(batch_states).squeeze(-1), batch_rewards_to_go)
-
-                        loss = actor_loss + value_coeff * critic_loss - entropy_coeff * entropy
-
-                        actor_optimizer.zero_grad()
-                        critic_optimizer.zero_grad()
-                        loss.backward()
-                        actor_optimizer.step()
-                        critic_optimizer.step()
-
-                        self.batch_buffer.reset()
-
+                if episode_done:
                     break
 
             scores_window.append(score)
             scores.append(score)
-            tqdm_range.set_description(f"Score: {np.mean(scores_window)}")
+            tqdm_range.set_description(f"Score: {np.mean(scores_window):.3f}")
 
         return scores
     
