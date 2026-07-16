@@ -15,11 +15,13 @@ trainer = A2CTrainer(env, device=device)
 
 
 
-n_episodes = 500
+n_episodes = 1000
 gamma = 0.99  # Discount factor
 value_coeff = 0.5
-entropy_coeff = 0.01
-learning_rate = 1e-3
+entropy_coeff = 0.001
+learning_rate = 1e-4
+n_steps = 20
+gae_lambda = 0.95
 
 class Actor(nn.Module):
     def __init__(self, n_observations, n_actions):
@@ -69,8 +71,12 @@ trainer.train(
     gamma = gamma,
     value_coeff = value_coeff,
     entropy_coeff = entropy_coeff,
-    n_steps=5,
-    gae_lambda=1.0,
+    max_steps=500,
+    n_steps=n_steps,
+    advantage="gae",
+    gae_lambda=gae_lambda,
+    normalize_advantages=False,
+    max_grad_norm=0.5,
 )
     
 env.close()
