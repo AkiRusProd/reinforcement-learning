@@ -69,7 +69,8 @@ trainer.train(
     gamma = gamma,
     value_coeff = value_coeff,
     entropy_coeff = entropy_coeff,
-    batch_size=32
+    n_steps=5,
+    gae_lambda=1.0,
 )
     
 env.close()
@@ -80,14 +81,15 @@ env = gym.make("CartPole-v1", render_mode="human")
 def test(model: torch.nn.Module):
     state, info = env.reset()
     terminated = False
-    while not terminated:
-        # action = trainer.policy(model, state)
-        action = torch.argmax(model(torch.tensor(state, dtype=torch.float32).to(device)))
+    truncated = False
+    model.eval()
+    while not (terminated or truncated):
+        with torch.no_grad():
+            action = torch.argmax(model(torch.tensor(state, dtype=torch.float32).to(device)))
 
-        state, reward, terminated, trancated, _ = env.step(action.item())
+        state, reward, terminated, truncated, _ = env.step(action.item())
         env.render()
 
 test(actor)
 
 env.close()
-
