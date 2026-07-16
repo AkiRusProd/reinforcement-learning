@@ -782,9 +782,10 @@ class A2CTrainer(BaseTrainer):
     def __init__(self, env: BaseEnvironment, device = None) -> None:
         super().__init__(env)
         self.device = device
+        self.buffer = Buffer()
 
     def policy(self, actor, critic, state):
-        state = torch.as_tensor(state, dtype=torch.float, device=self.device)
+        state = torch.tensor(state, dtype=torch.float).to(self.device)
 
         with torch.no_grad():
             logits = actor(state)
@@ -809,6 +810,23 @@ class A2CTrainer(BaseTrainer):
 
         return rewards_to_go
 
+    def generalized_advantage_estimation(self, rewards, values, dones, last_value=0.0, gamma=0.99, gae_lambda=0.95):
+        rewards = np.array(rewards, dtype=np.float32)
+        values = np.array(values, dtype=np.float32).reshape(-1)
+        dones = np.array(dones, dtype=np.float32)
+
+        advantages = np.zeros_like(rewards, dtype=np.float32)
+        last_advantage = 0.0
+
+        for index in reversed(range(len(rewards))):
+            next_value = last_value if index == len(rewards) - 1 else values[index + 1]
+            next_not_done = 1.0 - dones[index]
+            delta = rewards[index] + gamma * next_value * next_not_done - values[index]
+            last_advantage = delta + gamma * gae_lambda * next_not_done * last_advantage
+            advantages[index] = last_advantage
+
+        returns = advantages + values
+        return advantages, returns
 
     def train(
         self,
@@ -818,23 +836,20 @@ class A2CTrainer(BaseTrainer):
         actor_optimizer: torch.optim.Optimizer,
         critic_optimizer: torch.optim.Optimizer,
         n_episodes: int,
-        batch_size: int = None,
         gamma: float = 0.99,
         value_coeff: float = 0.5,
         entropy_coeff: float = 0.01,
         max_steps: int = None,
-        n_steps: int = None,
+        n_steps: int = 5,
+        advantage: str = "monte carlo",
         gae_lambda: float = 1.0,
         normalize_advantages: bool = True,
         max_grad_norm: float = 0.5,
     ):
-        if n_steps is None:
-            n_steps = batch_size if batch_size is not None else 5
-        elif batch_size is not None and batch_size != n_steps:
-            raise ValueError("batch_size and n_steps must match when both are provided")
-
         if n_steps <= 0:
             raise ValueError("n_steps must be greater than zero")
+        if advantage not in ("monte carlo", "gae"):
+            raise ValueError("advantage must be either 'monte carlo' or 'gae'")
         if not 0.0 <= gae_lambda <= 1.0:
             raise ValueError("gae_lambda must be between 0 and 1")
 
@@ -851,21 +866,13 @@ class A2CTrainer(BaseTrainer):
             step = 0
             episode_done = False
             while True:
-                rollout_states = []
-                rollout_actions = []
-                rollout_rewards = []
-                rollout_values = []
-                rollout_terminated = []
+                self.buffer.reset()
 
                 for _ in range(n_steps):
                     action, value = self.policy(actor, critic, state)
                     next_state, reward, terminated, truncated, _ = self.env.step(action.item())
 
-                    rollout_states.append(state)
-                    rollout_actions.append(action.item())
-                    rollout_rewards.append(reward)
-                    rollout_values.append(value.item())
-                    rollout_terminated.append(terminated)
+                    self.buffer.add(state, action.item(), value.item(), reward, terminated)
 
                     score += reward
                     state = next_state
@@ -876,59 +883,49 @@ class A2CTrainer(BaseTrainer):
                     if episode_done:
                         break
 
+                states, actions, values, rewards, dones = map(np.array, zip(*self.buffer.take()))
+
                 with torch.no_grad():
                     if terminated:
                         last_value = 0.0
                     else:
-                        last_state = torch.as_tensor(state, dtype=torch.float, device=self.device)
-                        last_value = critic(last_state).squeeze(-1).item()
+                        last_value = critic(
+                            torch.tensor(state, dtype=torch.float).to(self.device)
+                        ).squeeze(-1).item()
 
-                batch_rewards = torch.as_tensor(
-                    rollout_rewards, dtype=torch.float, device=self.device
-                )
-                batch_values = torch.as_tensor(
-                    rollout_values, dtype=torch.float, device=self.device
-                )
-                batch_terminated = torch.as_tensor(
-                    rollout_terminated, dtype=torch.float, device=self.device
-                )
-
-                advantages = torch.zeros_like(batch_rewards)
-                next_value = torch.as_tensor(last_value, dtype=torch.float, device=self.device)
-                next_advantage = torch.zeros((), dtype=torch.float, device=self.device)
-                for index in reversed(range(len(rollout_rewards))):
-                    non_terminal = 1.0 - batch_terminated[index]
-                    delta = (
-                        batch_rewards[index]
-                        + gamma * non_terminal * next_value
-                        - batch_values[index]
+                if advantage == "gae":
+                    advantages, returns = self.generalized_advantage_estimation(
+                        rewards=rewards,
+                        values=values,
+                        dones=dones,
+                        last_value=last_value,
+                        gamma=gamma,
+                        gae_lambda=gae_lambda,
                     )
-                    next_advantage = (
-                        delta
-                        + gamma * gae_lambda * non_terminal * next_advantage
+                else:
+                    returns = self.reward_to_go(
+                        rewards=rewards,
+                        dones=dones,
+                        gamma=gamma,
+                        last_value=last_value,
                     )
-                    advantages[index] = next_advantage
-                    next_value = batch_values[index]
+                    advantages = np.array(returns) - np.array(values).reshape(-1)
 
-                returns = advantages + batch_values
-                policy_advantages = advantages
-                if normalize_advantages and len(policy_advantages) > 1:
-                    policy_advantages = (
-                        policy_advantages - policy_advantages.mean()
-                    ) / (policy_advantages.std(unbiased=False) + 1e-8)
+                batch_states = torch.tensor(np.array(states), dtype=torch.float).to(self.device)
+                batch_actions = torch.tensor(np.array(actions), dtype=torch.int64).to(self.device)
+                batch_advantages = torch.tensor(np.array(advantages), dtype=torch.float).to(self.device)
+                batch_returns = torch.tensor(np.array(returns), dtype=torch.float).to(self.device)
 
-                batch_states = torch.as_tensor(
-                    np.array(rollout_states), dtype=torch.float, device=self.device
-                )
-                batch_actions = torch.as_tensor(
-                    rollout_actions, dtype=torch.int64, device=self.device
-                )
+                if normalize_advantages and len(batch_advantages) > 1:
+                    batch_advantages = (
+                        batch_advantages - batch_advantages.mean()
+                    ) / (batch_advantages.std(unbiased=False) + 1e-8)
 
                 dist = Categorical(logits=actor(batch_states))
-                actor_loss = -(dist.log_prob(batch_actions) * policy_advantages).mean()
+                actor_loss = -(dist.log_prob(batch_actions) * batch_advantages).mean()
                 entropy = dist.entropy().mean()
                 current_values = critic(batch_states).squeeze(-1)
-                critic_loss = criterion(current_values, returns)
+                critic_loss = criterion(current_values, batch_returns)
                 loss = actor_loss + value_coeff * critic_loss - entropy_coeff * entropy
 
                 actor_optimizer.zero_grad()
