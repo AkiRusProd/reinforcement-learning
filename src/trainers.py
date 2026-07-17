@@ -665,6 +665,213 @@ class DDPGTrainer(BaseTrainer):
                 target_buffer.copy_(source_buffer)
 
 
+class TD3Trainer(BaseTrainer):
+    """Twin Delayed DDPG trainer for continuous action spaces."""
+    # https://arxiv.org/pdf/1802.09477.pdf
+    def __init__(self, env: BaseEnvironment, memory: ReplayMemory = None, device = None) -> None:
+        super().__init__(env)
+        self.memory = memory
+        self.device = device
+        assert self.memory is not None, "Memory cannot be None"
+
+    def _action_bounds(self):
+        low = torch.tensor(self.env.action_space.low, dtype=torch.float, device=self.device).reshape(1, -1)
+        high = torch.tensor(self.env.action_space.high, dtype=torch.float, device=self.device).reshape(1, -1)
+        return low, high
+
+    def apply_noise(self, action, noise):
+        action = np.asarray(action, dtype=np.float32)
+        noise = np.asarray(noise, dtype=np.float32)
+        return np.clip(action + noise, self.env.action_space.low, self.env.action_space.high)
+
+    def policy(self, actor, state):
+        state = torch.tensor(state, dtype=torch.float).to(self.device)
+        with torch.no_grad():
+            action = actor(state).cpu().numpy()
+        return np.clip(np.asarray(action, dtype=np.float32), self.env.action_space.low, self.env.action_space.high)
+
+    def train(
+        self,
+        actor: torch.nn.Module,
+        critic1: torch.nn.Module,
+        critic2: torch.nn.Module,
+        actor_target: torch.nn.Module,
+        critic1_target: torch.nn.Module,
+        critic2_target: torch.nn.Module,
+        actor_optimizer: torch.optim.Optimizer,
+        critic_optimizer: torch.optim.Optimizer,
+        criterion: torch.nn.modules.loss._Loss,
+        noise: BaseNoise,
+        n_episodes: int,
+        gamma: float,
+        tau = 0.005,
+        max_steps: int = None,
+        policy_delay: int = 2,
+        target_noise_std: float = 0.2,
+        target_noise_clip: float = 0.5,
+        start_steps: int = 0,
+    ) -> np.ndarray:
+        assert 1 >= tau >= 0
+        assert policy_delay > 0
+        assert target_noise_std >= 0
+        assert target_noise_clip >= 0
+        assert start_steps >= 0
+
+        actor.to(self.device)
+        critic1.to(self.device)
+        critic2.to(self.device)
+        actor_target.to(self.device)
+        critic1_target.to(self.device)
+        critic2_target.to(self.device)
+
+        actor.train()
+        critic1.train()
+        critic2.train()
+        actor_target.load_state_dict(actor.state_dict())
+        critic1_target.load_state_dict(critic1.state_dict())
+        critic2_target.load_state_dict(critic2.state_dict())
+        actor_target.eval()
+        critic1_target.eval()
+        critic2_target.eval()
+
+        scores = []
+        scores_window = deque(maxlen=100)
+        global_step = 0
+        update_step = 0
+        tqdm_range = tqdm(range(n_episodes), total=n_episodes)
+        for _ in tqdm_range:
+            state, _ = self.env.reset()
+            if noise is not None:
+                noise.reset()
+
+            score = 0
+            step = 0
+            while True:
+                if global_step < start_steps:
+                    action = self.env.action_space.sample()
+                else:
+                    action = self.policy(actor, state)
+                    if noise is not None:
+                        action = self.apply_noise(action, noise.sample())
+
+                next_state, reward, terminated, truncated, _ = self.env.step(action)
+
+                done = terminated
+                episode_done = terminated or truncated
+                score += reward
+
+                self.memory.add(state, action, reward, next_state, done)
+
+                if len(self.memory) >= self.memory.batch_size:
+                    transitions = self.memory.sample()
+                    update_actor = update_step % policy_delay == 0
+
+                    self._batch_train(
+                        actor=actor,
+                        critic1=critic1,
+                        critic2=critic2,
+                        actor_target=actor_target,
+                        critic1_target=critic1_target,
+                        critic2_target=critic2_target,
+                        actor_optimizer=actor_optimizer,
+                        critic_optimizer=critic_optimizer,
+                        criterion=criterion,
+                        gamma=gamma,
+                        tau=tau,
+                        transitions=transitions,
+                        update_actor=update_actor,
+                        target_noise_std=target_noise_std,
+                        target_noise_clip=target_noise_clip,
+                    )
+                    update_step += 1
+
+                state = next_state
+                step += 1
+                global_step += 1
+
+                max_steps_reached = max_steps is not None and step >= max_steps
+                if episode_done or max_steps_reached:
+                    break
+
+            scores.append(score)
+            scores_window.append(score)
+            tqdm_range.set_description(f"Score: {np.mean(scores_window):.3f}")
+
+        return scores
+
+    def _batch_train(
+        self,
+        actor: torch.nn.Module,
+        critic1: torch.nn.Module,
+        critic2: torch.nn.Module,
+        actor_target: torch.nn.Module,
+        critic1_target: torch.nn.Module,
+        critic2_target: torch.nn.Module,
+        actor_optimizer: torch.optim.Optimizer,
+        critic_optimizer: torch.optim.Optimizer,
+        criterion: torch.nn.modules.loss._Loss,
+        gamma,
+        tau,
+        transitions,
+        update_actor: bool,
+        target_noise_std: float,
+        target_noise_clip: float,
+    ):
+        states, actions, rewards, next_states, dones = map(list, zip(*transitions))
+
+        states = torch.tensor(np.array(states), dtype=torch.float).to(self.device)
+        actions = torch.tensor(np.array(actions), dtype=torch.float).to(self.device).reshape(len(states), -1)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float).to(self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float).to(self.device).reshape(-1, 1)
+        dones = torch.tensor(dones, dtype=torch.float).to(self.device).reshape(-1, 1)
+        action_low, action_high = self._action_bounds()
+
+        with torch.no_grad():
+            target_noise = torch.randn_like(actions) * target_noise_std
+            target_noise = target_noise.clamp(-target_noise_clip, target_noise_clip)
+            next_actions = actor_target(next_states) + target_noise
+            next_actions = torch.max(torch.min(next_actions, action_high), action_low)
+
+            next_q1 = critic1_target(next_states, next_actions)
+            next_q2 = critic2_target(next_states, next_actions)
+            next_q = torch.min(next_q1, next_q2)
+            q_target = rewards + gamma * (1 - dones) * next_q
+
+        q1 = critic1(states, actions)
+        q2 = critic2(states, actions)
+        critic_loss = criterion(q1, q_target) + criterion(q2, q_target)
+
+        critic_optimizer.zero_grad()
+        critic_loss.backward()
+        critic_optimizer.step()
+
+        if not update_actor:
+            return
+
+        for parameter in critic1.parameters():
+            parameter.requires_grad = False
+
+        actor_loss = -critic1(states, actor(states)).mean()
+
+        actor_optimizer.zero_grad()
+        actor_loss.backward()
+        actor_optimizer.step()
+
+        for parameter in critic1.parameters():
+            parameter.requires_grad = True
+
+        self._soft_update(actor_target, actor, tau)
+        self._soft_update(critic1_target, critic1, tau)
+        self._soft_update(critic2_target, critic2, tau)
+
+    def _soft_update(self, target: torch.nn.Module, source: torch.nn.Module, tau: float):
+        with torch.no_grad():
+            for target_param, source_param in zip(target.parameters(), source.parameters()):
+                target_param.data.copy_(source_param.data*tau + target_param.data*(1-tau))
+            for target_buffer, source_buffer in zip(target.buffers(), source.buffers()):
+                target_buffer.copy_(source_buffer)
+
+
 class VPGTrainer(BaseTrainer):
     def __init__(self, env: BaseEnvironment, device = None) -> None:
         super().__init__(env)
