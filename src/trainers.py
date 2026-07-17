@@ -872,6 +872,227 @@ class TD3Trainer(BaseTrainer):
                 target_buffer.copy_(source_buffer)
 
 
+class SACTrainer(BaseTrainer):
+    """Soft Actor-Critic trainer for continuous action spaces."""
+    # https://arxiv.org/pdf/1812.05905.pdf
+    def __init__(self, env: BaseEnvironment, memory: ReplayMemory = None, device = None) -> None:
+        super().__init__(env)
+        self.memory = memory
+        self.device = device
+        assert self.memory is not None, "Memory cannot be None"
+
+    def _sample_action_and_log_prob(self, actor, states):
+        if hasattr(actor, "sample"):
+            actions, log_probs = actor.sample(states)
+        else:
+            output = actor(states)
+            if not isinstance(output, tuple) or len(output) < 2:
+                raise AttributeError("SAC actor must define sample(states) or return (actions, log_probs)")
+            actions, log_probs = output[:2]
+
+        if log_probs.dim() == 1:
+            log_probs = log_probs.unsqueeze(-1)
+
+        return actions, log_probs
+
+    def policy(self, actor, state, deterministic: bool = False):
+        state = torch.tensor(state, dtype=torch.float, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            if deterministic and hasattr(actor, "deterministic"):
+                action = actor.deterministic(state)
+            else:
+                action, _ = self._sample_action_and_log_prob(actor, state)
+        action = action.squeeze(0).cpu().numpy().astype(np.float32)
+        return np.clip(action, self.env.action_space.low, self.env.action_space.high)
+
+    def train(
+        self,
+        actor: torch.nn.Module,
+        critic1: torch.nn.Module,
+        critic2: torch.nn.Module,
+        critic1_target: torch.nn.Module,
+        critic2_target: torch.nn.Module,
+        actor_optimizer: torch.optim.Optimizer,
+        critic_optimizer: torch.optim.Optimizer,
+        criterion: torch.nn.modules.loss._Loss,
+        n_episodes: int,
+        gamma: float,
+        alpha: float = 0.2,
+        tau = 0.005,
+        max_steps: int = None,
+        start_steps: int = 0,
+        log_alpha: torch.Tensor = None,
+        alpha_optimizer: torch.optim.Optimizer = None,
+        target_entropy: float = None,
+    ) -> np.ndarray:
+        assert 1 >= tau >= 0
+        assert start_steps >= 0
+        if log_alpha is None and alpha_optimizer is None:
+            assert alpha > 0
+        elif log_alpha is None or alpha_optimizer is None:
+            raise ValueError("log_alpha and alpha_optimizer must be provided together")
+
+        if target_entropy is None:
+            target_entropy = -float(np.prod(self.env.action_space.shape))
+
+        actor.to(self.device)
+        critic1.to(self.device)
+        critic2.to(self.device)
+        critic1_target.to(self.device)
+        critic2_target.to(self.device)
+
+        actor.train()
+        critic1.train()
+        critic2.train()
+        critic1_target.load_state_dict(critic1.state_dict())
+        critic2_target.load_state_dict(critic2.state_dict())
+        critic1_target.eval()
+        critic2_target.eval()
+
+        if log_alpha is not None:
+            model_device = next(actor.parameters()).device
+            if log_alpha.device != model_device:
+                raise ValueError(f"log_alpha must be on {model_device}, got {log_alpha.device}")
+            if not log_alpha.requires_grad:
+                raise ValueError("log_alpha must require gradients when alpha_optimizer is provided")
+
+        scores = []
+        scores_window = deque(maxlen=100)
+        global_step = 0
+        tqdm_range = tqdm(range(n_episodes), total=n_episodes)
+        for _ in tqdm_range:
+            state, _ = self.env.reset()
+
+            score = 0
+            step = 0
+            while True:
+                if global_step < start_steps:
+                    action = self.env.action_space.sample()
+                else:
+                    action = self.policy(actor, state)
+
+                next_state, reward, terminated, truncated, _ = self.env.step(action)
+
+                done = terminated
+                episode_done = terminated or truncated
+                score += reward
+
+                self.memory.add(state, action, reward, next_state, done)
+
+                if len(self.memory) >= self.memory.batch_size:
+                    transitions = self.memory.sample()
+                    self._batch_train(
+                        actor=actor,
+                        critic1=critic1,
+                        critic2=critic2,
+                        critic1_target=critic1_target,
+                        critic2_target=critic2_target,
+                        actor_optimizer=actor_optimizer,
+                        critic_optimizer=critic_optimizer,
+                        criterion=criterion,
+                        gamma=gamma,
+                        alpha=alpha,
+                        tau=tau,
+                        transitions=transitions,
+                        log_alpha=log_alpha,
+                        alpha_optimizer=alpha_optimizer,
+                        target_entropy=target_entropy,
+                    )
+
+                state = next_state
+                step += 1
+                global_step += 1
+
+                max_steps_reached = max_steps is not None and step >= max_steps
+                if episode_done or max_steps_reached:
+                    break
+
+            scores.append(score)
+            scores_window.append(score)
+            tqdm_range.set_description(f"Score: {np.mean(scores_window):.3f}")
+
+        return scores
+
+    def _batch_train(
+        self,
+        actor: torch.nn.Module,
+        critic1: torch.nn.Module,
+        critic2: torch.nn.Module,
+        critic1_target: torch.nn.Module,
+        critic2_target: torch.nn.Module,
+        actor_optimizer: torch.optim.Optimizer,
+        critic_optimizer: torch.optim.Optimizer,
+        criterion: torch.nn.modules.loss._Loss,
+        gamma,
+        alpha,
+        tau,
+        transitions,
+        log_alpha,
+        alpha_optimizer,
+        target_entropy,
+    ):
+        states, actions, rewards, next_states, dones = map(list, zip(*transitions))
+
+        states = torch.tensor(np.array(states), dtype=torch.float).to(self.device)
+        actions = torch.tensor(np.array(actions), dtype=torch.float).to(self.device).reshape(len(states), -1)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float).to(self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float).to(self.device).reshape(-1, 1)
+        dones = torch.tensor(dones, dtype=torch.float).to(self.device).reshape(-1, 1)
+
+        alpha_value = log_alpha.exp().detach() if log_alpha is not None else torch.tensor(alpha, dtype=torch.float, device=self.device)
+
+        with torch.no_grad():
+            next_actions, next_log_probs = self._sample_action_and_log_prob(actor, next_states)
+            next_q1 = critic1_target(next_states, next_actions)
+            next_q2 = critic2_target(next_states, next_actions)
+            next_q = torch.min(next_q1, next_q2) - alpha_value * next_log_probs
+            q_target = rewards + gamma * (1 - dones) * next_q
+
+        q1 = critic1(states, actions)
+        q2 = critic2(states, actions)
+        critic_loss = criterion(q1, q_target) + criterion(q2, q_target)
+
+        critic_optimizer.zero_grad()
+        critic_loss.backward()
+        critic_optimizer.step()
+
+        for parameter in critic1.parameters():
+            parameter.requires_grad = False
+        for parameter in critic2.parameters():
+            parameter.requires_grad = False
+
+        sampled_actions, log_probs = self._sample_action_and_log_prob(actor, states)
+        q1_pi = critic1(states, sampled_actions)
+        q2_pi = critic2(states, sampled_actions)
+        q_pi = torch.min(q1_pi, q2_pi)
+        actor_loss = (alpha_value * log_probs - q_pi).mean()
+
+        actor_optimizer.zero_grad()
+        actor_loss.backward()
+        actor_optimizer.step()
+
+        for parameter in critic1.parameters():
+            parameter.requires_grad = True
+        for parameter in critic2.parameters():
+            parameter.requires_grad = True
+
+        if log_alpha is not None and alpha_optimizer is not None:
+            alpha_loss = -(log_alpha * (log_probs + target_entropy).detach()).mean()
+            alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            alpha_optimizer.step()
+
+        self._soft_update(critic1_target, critic1, tau)
+        self._soft_update(critic2_target, critic2, tau)
+
+    def _soft_update(self, target: torch.nn.Module, source: torch.nn.Module, tau: float):
+        with torch.no_grad():
+            for target_param, source_param in zip(target.parameters(), source.parameters()):
+                target_param.data.copy_(source_param.data*tau + target_param.data*(1-tau))
+            for target_buffer, source_buffer in zip(target.buffers(), source.buffers()):
+                target_buffer.copy_(source_buffer)
+
+
 class VPGTrainer(BaseTrainer):
     def __init__(self, env: BaseEnvironment, device = None) -> None:
         super().__init__(env)
